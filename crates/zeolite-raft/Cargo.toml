@@ -1,0 +1,19 @@
+[package]
+name = "zeolite-raft"
+description = "Raft consensus: sans-IO core, durable log, and encrypted transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+chacha20poly1305 = "0.10"
+crc32fast = "1"
+getrandom = "0.3"
+hkdf = "0.12"
+sha2 = "0.10"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }

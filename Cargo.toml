@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Jeong Hoon Kim <jk9576@hanyang.ac.kr>"]
+repository = "https://github.com/Aetherx86/Zeolite"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
