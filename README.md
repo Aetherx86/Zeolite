@@ -172,7 +172,14 @@ On an Apple Silicon laptop, in a debug build:
 | Wasm instance creation, median | 16 microseconds |
 | Micro-VM, boot to halt with a small AArch64 payload | About 60 microseconds |
 
-These are single-machine measurements of small payloads, not a benchmark suite.
+On a GitHub Actions runner, under nested virtualization:
+
+| Operation | Time |
+|---|---|
+| Unmodified Linux 7.0 distribution kernel, boot to its first userspace process and reboot | About 4.4 seconds |
+
+These are single measurements, not a benchmark suite. The kernel is a large general-purpose
+build that was not tuned for fast booting.
 
 ## Limitations
 
