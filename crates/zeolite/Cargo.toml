@@ -1,0 +1,31 @@
+[package]
+name = "zeolite"
+description = "Distributed micro-VM and sandboxed function runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "zeolite"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.3"
+hmac = "0.13"
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+zeolite-faas = { path = "../zeolite-faas" }
+zeolite-jit = { path = "../zeolite-jit" }
+zeolite-raft = { path = "../zeolite-raft" }
+zeolite-vmm = { path = "../zeolite-vmm" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util"] }
+wat = "1"

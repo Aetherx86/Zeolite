@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    tags:
+      - "v*.0.0"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  quality:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo test --workspace --locked
+
+  kvm:
+    name: Boot real guests under KVM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Grant access to /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Prepare a test kernel and initramfs
+        run: |
+          sudo cp "/boot/vmlinuz-$(uname -r)" "$RUNNER_TEMP/vmlinuz"
+          sudo chmod a+r "$RUNNER_TEMP/vmlinuz"
+          mkdir "$RUNNER_TEMP/root"
+          gcc -static -O2 -o "$RUNNER_TEMP/root/init" scripts/test-init.c
+          (cd "$RUNNER_TEMP/root" && find . | cpio --quiet -o -H newc > "$RUNNER_TEMP/initrd.cpio")
+          ls -l "$RUNNER_TEMP/vmlinuz" "$RUNNER_TEMP/initrd.cpio"
+      - name: Boot tests
+        env:
+          ZEOLITE_REQUIRE_HV: "1"
+        run: |
+          export ZEOLITE_TEST_KERNEL="$RUNNER_TEMP/vmlinuz"
+          export ZEOLITE_TEST_INITRD="$RUNNER_TEMP/initrd.cpio"
+          cargo test --locked -p zeolite-vmm --test hypervisor -- --nocapture --test-threads=1
+          cargo test --locked -p zeolite --test cluster micro_vm -- --nocapture
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit

@@ -1,0 +1,14 @@
+[package]
+name = "zeolite-vmm"
+description = "Virtual machine monitor on KVM and Hypervisor.framework, with a Linux boot loader and virtio devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+getrandom = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

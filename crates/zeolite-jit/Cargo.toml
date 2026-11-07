@@ -1,0 +1,15 @@
+[package]
+name = "zeolite-jit"
+description = "Deterministic, gas-metered language runtime with an interpreter and a Cranelift JIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+cranelift-codegen = "0.135"
+cranelift-frontend = "0.135"
+cranelift-jit = "0.135"
+cranelift-module = "0.135"
+cranelift-native = "0.135"

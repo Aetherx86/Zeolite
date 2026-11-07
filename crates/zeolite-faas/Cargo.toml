@@ -1,0 +1,14 @@
+[package]
+name = "zeolite-faas"
+description = "Multi-tenant WebAssembly function engine with per-request instruction metering"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation"] }
+
+[dev-dependencies]
+wat = "1"
