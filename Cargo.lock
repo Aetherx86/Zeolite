@@ -1432,9 +1432,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.4"
+version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
+checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 dependencies = [
  "serde",
 ]
@@ -1999,7 +1999,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "zeolite"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "clap",
@@ -2019,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "zeolite-faas"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "wasmtime",
  "wat",
@@ -2027,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "zeolite-jit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "zeolite-raft"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chacha20poly1305",
  "crc32fast",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "zeolite-vmm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "getrandom 0.3.4",
  "libc",

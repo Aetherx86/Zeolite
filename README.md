@@ -184,6 +184,9 @@ A bug or security fix increments `0.0.X`. New functionality or new platform supp
 increments `0.X.0`. See [CHANGELOG.md](CHANGELOG.md). Each tag publishes binaries to GitHub
 Releases and a container image to `ghcr.io/aetherx86/zeolite`.
 
+CI runs `cargo audit` on every push. The one accepted warning, an unmaintained crate that
+arrives through wasmtime, is listed with its reason in `.cargo/audit.toml`.
+
 ## Limitations
 
 - **Hypervisor host platforms**: Hardware-accelerated microVMs require KVM on Linux (`x86_64` / `aarch64`) or `Hypervisor.framework` on macOS (`Apple Silicon` with the `com.apple.security.hypervisor` entitlement).

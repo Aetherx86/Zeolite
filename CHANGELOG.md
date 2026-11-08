@@ -3,6 +3,13 @@
 Versions follow this rule: a bug or security fix increments `0.0.X`, and new functionality
 or new platform support increments `0.X.0`.
 
+## 0.1.1
+
+Security
+
+- `smallvec` 1.16.4 to 1.16.5.
+- `.cargo/audit.toml` records the one remaining `cargo audit` warning, RUSTSEC-2023-0089: `atomic-polyfill` is unmaintained, not vulnerable, and arrives only through wasmtime and Cranelift (`postcard` to `heapless` 0.7). `cargo audit` now reports no vulnerabilities and no warnings.
+
 ## 0.1.0
 
 First release.
