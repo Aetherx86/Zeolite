@@ -8,8 +8,8 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-cranelift-codegen = "0.135"
-cranelift-frontend = "0.135"
-cranelift-jit = "0.135"
-cranelift-module = "0.135"
-cranelift-native = "0.135"
+cranelift-codegen = "0.137"
+cranelift-frontend = "0.137"
+cranelift-jit = "0.137"
+cranelift-module = "0.137"
+cranelift-native = "0.137"
