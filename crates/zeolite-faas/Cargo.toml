@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation"] }
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation"] }
 
 [dev-dependencies]
 wat = "1"
