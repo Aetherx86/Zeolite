@@ -336,3 +336,73 @@ fn backends_agree_on_overflow_and_recursion_traps() {
     assert_eq!(a.result, Err(Trap::StackOverflow));
     assert_eq!(a_mem, b_mem, "the depth at which the trap fired must match");
 }
+
+/// Gas metering is exact and monotone on both backends: a call given exactly the gas it
+/// used reproduces the same outcome and memory, one unit less runs out of gas without
+/// using more than was granted, and no run ever reports more gas than its limit.
+#[test]
+fn gas_metering_is_exact_on_both_backends() {
+    let mut exact_checks = 0u32;
+    let mut short_checks = 0u32;
+    for seed in 1..=200u64 {
+        let mut generator = Gen {
+            rng: Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1),
+            vars: Vec::new(),
+            functions: Vec::new(),
+            next_var: 0,
+            in_loop: false,
+            budget: 0,
+        };
+        let (src, functions) = generator.program();
+        let module = Module::compile(&src).unwrap();
+        for (name, arity) in &functions {
+            let args: Vec<i64> = (0..*arity)
+                .map(|_| INTERESTING[generator.rng.below(INTERESTING.len() as u64) as usize])
+                .collect();
+            for backend in [Backend::Interpreter, Backend::Jit] {
+                let run = |gas: u64| {
+                    let mut mem = vec![0u8; 4096];
+                    let outcome = module
+                        .call(backend, name, &args, &mut mem, Limits::with_gas(gas))
+                        .unwrap();
+                    assert!(
+                        outcome.gas_used <= gas,
+                        "seed {seed}: {backend:?} used {} of {gas}",
+                        outcome.gas_used
+                    );
+                    (outcome, mem)
+                };
+                let (full, full_mem) = run(200_000);
+                if full.result == Err(Trap::OutOfGas) {
+                    continue;
+                }
+                let (exact, exact_mem) = run(full.gas_used);
+                assert_eq!(
+                    exact, full,
+                    "seed {seed}: {backend:?} {name} with exact gas"
+                );
+                assert!(exact_mem == full_mem, "seed {seed}: memory differs");
+                exact_checks += 1;
+
+                if full.gas_used > 0 {
+                    let (short, _) = run(full.gas_used - 1);
+                    assert_eq!(
+                        short.result,
+                        Err(Trap::OutOfGas),
+                        "seed {seed}: {backend:?} {name} finished with one unit too few\n{src}"
+                    );
+                    assert!(short.gas_used < full.gas_used);
+                    short_checks += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        exact_checks > 300,
+        "only {exact_checks} exact-gas checks ran"
+    );
+    assert!(
+        short_checks > 300,
+        "only {short_checks} short-gas checks ran"
+    );
+}

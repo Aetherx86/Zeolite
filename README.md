@@ -35,7 +35,7 @@ walled-off workloads inside one solid structure.
 **`zeolite-raft`** is consensus, written from scratch. The protocol core is sans-IO: it
 never touches a clock, a disk or a socket, which is what makes it possible to test it
 deterministically. It implements elections with pre-vote, check-quorum, log replication,
-and log compaction through snapshots. Around the core are a checksummed write-ahead log
+log compaction through snapshots, and leadership transfer. Around the core are a checksummed write-ahead log
 that recovers from torn writes, and a transport where every frame is encrypted and
 authenticated (ChaCha20-Poly1305, with per-direction keys derived from a pre-shared
 cluster key and fresh nonces).
@@ -124,6 +124,7 @@ curl 127.0.0.1:8002/v1/digest
 | --- | --- | --- |
 | `GET /v1/status` | Role, term, leader and log positions | None |
 | `GET /v1/digest` | SHA-256 of the replicated state | None |
+| `POST /v1/leadership/transfer` | Hand leadership to another node | Token |
 | `PUT /v1/functions/{tenant}/{name}?kind=zel\|wasm\|vm` | Deploy a workload | Token |
 | `DELETE /v1/functions/{tenant}/{name}` | Remove a workload | Token |
 | `POST /v1/functions/{tenant}/{name}/execute/{function}` | Run Zel on all replicas | Token |
@@ -143,17 +144,91 @@ secret is set at deploy time with `webhook_secret=...`, and callers then sign th
 A module exports `memory`, `alloc(len: i32) -> i32` and
 `handle(ptr: i32, len: i32) -> i64`, which returns `(output_ptr << 32) | output_len`.
 
+## Leadership transfer, offline inspection and backend comparison
+
+Added in 0.2.0. Every command below was run against a local three-node cluster started
+as in the quick start.
+
+### Moving leadership
+
+Before taking the leader down for maintenance, hand leadership to another node:
+
+```sh
+curl -H "$AUTH" -X POST "$LEADER/v1/leadership/transfer" -d '{"to":2}'
+# {"leader":2,"leader_http":"127.0.0.1:8002","status":"transferred","term":2}
+```
+
+The leader stops accepting writes, brings node 2's log up to date, then tells it to start
+an election immediately. The request returns once this node sees node 2 lead, normally
+one term later. `timeout_ms` in the body bounds the wait (default 5000, at most 60000).
+If the target has not taken over within one election timeout, the transfer is dropped
+and the old leader resumes taking writes. While a transfer is in flight, the leader
+answers writes with status 421 naming the target. Once it has handed off, it answers
+writes and transfer requests with 421 naming the new leader:
+
+```sh
+curl -H "$AUTH" -X POST "$LEADER/v1/leadership/transfer" -d '{"to":3}'
+# {"error":"this node is not the leader","leader":2,"leader_http":"127.0.0.1:8002"}
+```
+
+All nodes must run 0.2.0 or later, because the hand-off uses a new consensus message.
+
+### Inspecting a data directory
+
+`zeolite inspect` reads a node's data directory without changing it, so it is safe on a
+stopped node, or on a copy of a running node's directory. It shows what the node would
+recover, and replays the committed log onto the snapshot to compute the state digest at
+the stored commit index:
+
+```sh
+$Z inspect data/1
+# wal         514 bytes (514 valid, 0 torn)
+# records     7 hard state, 0 truncate, 5 entry
+# hard state  term 2, voted for 2, commit 5
+# snapshot    none
+# log         1..=5 (5 usable, 0 discarded)
+# commit      5
+# commands    1 deploy_zel, 2 execute, 2 noop
+# state       applied 5, 1 workloads, digest c8bd238c...
+$Z inspect data/2 --json
+```
+
+Replicas stopped at the same commit index report the same digest, and it is the digest
+`/v1/digest` returned while they ran. Torn bytes are what a crash left at the tail of the
+log, which the node truncates when it next starts. The command exits non-zero when the
+snapshot is corrupt or its state does not decode, which are the cases where a node
+refuses to start.
+
+### Running Zel with JSON output, or on both backends
+
+```sh
+$Z zel program.zel --call add --args 2,-5 --json
+# {"backend":"jit","function":"add","gas_used":7,"memory_sha256":"2a97...","result":-3}
+$Z zel program.zel --call div --args 1,0 --json
+# {"backend":"jit","function":"div","gas_used":3,"memory_sha256":"de2f...","trap":"division by zero"}
+$Z zel program.zel --call add --args 40,2 --compare
+# interpreter  42 (gas used 7)
+# jit          42 (gas used 7)
+```
+
+With `--json`, a trap is reported in the output and the exit status is 0. Without it, a
+trap is an error exit as before. `--compare` runs the call on the interpreter and the JIT,
+each against its own copy of memory, and exits non-zero unless the result, the gas used
+and the final memory all agree. Add `--json` to get both outcomes and an `agree` field.
+
 ## How it is tested
 
 The goal is tests that can fail, so several were checked by deliberately breaking the code.
 
 - **Raft** runs in a deterministic simulator with message loss, duplication, reordering,
-  partitions, crashes and compaction across hundreds of seeded runs, checking Election
+  partitions, crashes, compaction and leadership transfers across hundreds of seeded
+  runs, checking Election
   Safety, Log Matching, Leader Completeness and State Machine Safety throughout. Directed
   tests cover scenarios chaos rarely reaches, such as Figure 8 of the Raft paper.
 - **The JIT** is differentially tested against the interpreter on randomly generated
   programs, comparing results, gas and final memory. The test fails if the generator stops
-  producing a variety of outcomes.
+  producing a variety of outcomes. A property test checks that metering is exact on both:
+  a call given exactly the gas it used repeats its outcome, and one unit less runs out.
 - **Mutation checks**: known bugs were injected into the Raft core and the JIT, such as an
   off-by-one quorum, double voting, signed bounds checks and dropped callee traps. Each one
   made the suite fail. Mutants that initially survived led to new tests.
@@ -161,7 +236,9 @@ The goal is tests that can fail, so several were checked by deliberately breakin
   small static init. The virtio stack is driven through its registers and rings with hostile
   input, on every platform.
 - **The cluster** tests run real nodes with real sockets and fsync, including leader
-  failure, full restarts and catching up through snapshots.
+  failure, full restarts, catching up through snapshots and leadership transfer.
+- **The command line** is tested by running the built binary, including a check that
+  `inspect` leaves a data directory byte for byte unchanged.
 
 ## Measured
 
@@ -184,8 +261,9 @@ A bug or security fix increments `0.0.X`. New functionality or new platform supp
 increments `0.X.0`. See [CHANGELOG.md](CHANGELOG.md). Each tag publishes binaries to GitHub
 Releases and a container image to `ghcr.io/aetherx86/zeolite`.
 
-CI runs `cargo audit` on every push. The one accepted warning, an unmaintained crate that
-arrives through wasmtime, is listed with its reason in `.cargo/audit.toml`.
+CI runs `cargo audit`. It reports no vulnerabilities. One unmaintained crate that arrives
+through wasmtime is accepted, with its reason, in `.cargo/audit.toml`. Nine unsoundness
+warnings for `heapless` 0.7, which arrives through `postcard`, are still reported.
 
 ## Limitations
 

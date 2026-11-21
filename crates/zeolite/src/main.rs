@@ -57,8 +57,23 @@ enum Commands {
         gas: u64,
         #[arg(long, default_value_t = 65536)]
         memory: usize,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "compare")]
         interpret: bool,
+        /// Runs the call on both the interpreter and the JIT, each on its own copy of
+        /// memory, and fails unless results, gas and final memory all agree.
+        #[arg(long)]
+        compare: bool,
+        /// Prints the outcome as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Examines a node's data directory without modifying it.
+    Inspect {
+        /// The directory given to `serve --data`.
+        dir: PathBuf,
+        /// Prints the report as JSON on stdout.
+        #[arg(long)]
+        json: bool,
     },
     /// Runs a Wasm function locally, with stdin as its input.
     Wasm {
@@ -160,6 +175,36 @@ async fn serve(
     Ok(())
 }
 
+struct ZelRun {
+    backend: Backend,
+    outcome: zeolite_jit::Outcome,
+    memory: Vec<u8>,
+}
+
+impl ZelRun {
+    fn json(&self) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let digest: String = Sha256::digest(&self.memory)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let mut value = serde_json::json!({
+            "backend": match self.backend {
+                Backend::Interpreter => "interpreter",
+                Backend::Jit => "jit",
+            },
+            "gas_used": self.outcome.gas_used,
+            "memory_sha256": digest,
+        });
+        match self.outcome.result {
+            Ok(result) => value["result"] = result.into(),
+            Err(trap) => value["trap"] = trap.to_string().into(),
+        }
+        value
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_zel(
     file: PathBuf,
     call: String,
@@ -167,23 +212,98 @@ fn run_zel(
     gas: u64,
     memory: usize,
     interpret: bool,
+    compare: bool,
+    json: bool,
 ) -> Result<(), AnyError> {
     let source = std::fs::read_to_string(file)?;
-    let (module, backend) = if interpret {
-        (Module::compile_interpreted(&source)?, Backend::Interpreter)
+    let module = if interpret {
+        Module::compile_interpreted(&source)?
     } else {
-        (Module::compile(&source)?, Backend::Jit)
+        Module::compile(&source)?
     };
-    let mut linear = vec![0u8; memory];
-    let outcome = module.call(backend, &call, &args, &mut linear, JitLimits::with_gas(gas))?;
-    eprintln!("gas used: {}", outcome.gas_used);
-    match outcome.result {
+    let backends: &[Backend] = if compare {
+        &[Backend::Interpreter, Backend::Jit]
+    } else if interpret {
+        &[Backend::Interpreter]
+    } else {
+        &[Backend::Jit]
+    };
+    let mut runs = Vec::new();
+    for backend in backends {
+        let mut linear = vec![0u8; memory];
+        let outcome = module.call(
+            *backend,
+            &call,
+            &args,
+            &mut linear,
+            JitLimits::with_gas(gas),
+        )?;
+        runs.push(ZelRun {
+            backend: *backend,
+            outcome,
+            memory: linear,
+        });
+    }
+
+    if compare {
+        let (a, b) = (&runs[0], &runs[1]);
+        let agree = a.outcome == b.outcome && a.memory == b.memory;
+        if json {
+            let report = serde_json::json!({
+                "function": call,
+                "agree": agree,
+                "interpreter": a.json(),
+                "jit": b.json(),
+            });
+            println!("{report}");
+        } else {
+            for run in &runs {
+                let shown = run.json();
+                println!(
+                    "{:<12} {} (gas used {})",
+                    shown["backend"].as_str().unwrap_or(""),
+                    match run.outcome.result {
+                        Ok(value) => value.to_string(),
+                        Err(trap) => format!("trap: {trap}"),
+                    },
+                    run.outcome.gas_used
+                );
+            }
+        }
+        if !agree {
+            return Err("the interpreter and the JIT disagree".into());
+        }
+        return Ok(());
+    }
+
+    let run = &runs[0];
+    if json {
+        let mut report = run.json();
+        report["function"] = call.into();
+        println!("{report}");
+        return Ok(());
+    }
+    eprintln!("gas used: {}", run.outcome.gas_used);
+    match run.outcome.result {
         Ok(value) => {
             println!("{value}");
             Ok(())
         }
         Err(trap) => Err(format!("trap: {trap}").into()),
     }
+}
+
+fn run_inspect(dir: PathBuf, json: bool) -> Result<(), AnyError> {
+    let report = zeolite::inspect::inspect(&dir)?;
+    if json {
+        println!("{}", zeolite::inspect::to_json(&report));
+    } else {
+        print!("{}", zeolite::inspect::to_text(&report));
+    }
+    if report.is_unrecoverable() {
+        return Err("a node could not start from this directory".into());
+    }
+    Ok(())
 }
 
 fn run_wasm(file: PathBuf, fuel: u64) -> Result<(), AnyError> {
@@ -276,7 +396,10 @@ fn main() -> Result<(), AnyError> {
             gas,
             memory,
             interpret,
-        } => run_zel(file, call, args, gas, memory, interpret),
+            compare,
+            json,
+        } => run_zel(file, call, args, gas, memory, interpret, compare, json),
+        Commands::Inspect { dir, json } => run_inspect(dir, json),
         Commands::Wasm { file, fuel } => run_wasm(file, fuel),
         Commands::Vm {
             kernel,

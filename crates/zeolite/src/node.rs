@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc as async_mpsc, oneshot};
 use zeolite_raft::{
-    Config, Envelope, Index, NodeId, ProposeError, Raft, Ready, Role, Storage, Term, Transport,
-    TransportConfig,
+    Config, Envelope, Index, NodeId, ProposeError, Raft, Ready, Role, Storage, Term, TransferError,
+    Transport, TransportConfig,
 };
 
 #[derive(Clone)]
@@ -83,6 +83,31 @@ impl std::fmt::Display for ProposeFailure {
 impl std::error::Error for ProposeFailure {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferFailure {
+    /// Only the leader can hand off leadership. The hint names the leader when known.
+    NotLeader {
+        leader: Option<NodeId>,
+    },
+    /// The target is not a member of the cluster.
+    UnknownPeer(NodeId),
+    Stopped,
+}
+
+impl std::fmt::Display for TransferFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransferFailure::NotLeader { leader } => {
+                TransferError::NotLeader { leader: *leader }.fmt(f)
+            }
+            TransferFailure::UnknownPeer(id) => TransferError::UnknownPeer(*id).fmt(f),
+            TransferFailure::Stopped => write!(f, "the node is stopping"),
+        }
+    }
+}
+
+impl std::error::Error for TransferFailure {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
     pub id: NodeId,
     pub role: Role,
@@ -100,6 +125,7 @@ enum Input {
     Message(Envelope),
     Propose(Vec<u8>, ProposeReply),
     Status(oneshot::Sender<Status>),
+    Transfer(NodeId, oneshot::Sender<Result<(), TransferFailure>>),
     Stop,
 }
 
@@ -192,6 +218,17 @@ impl Node {
             .send(Input::Propose(data, tx))
             .map_err(|_| ProposeFailure::Stopped)?;
         rx.await.map_err(|_| ProposeFailure::Stopped)?
+    }
+
+    /// Asks this node, which must be the leader, to hand leadership to `to`. Returns
+    /// once the hand-off has started. Poll [`Node::status`] to see it complete: the
+    /// transfer is abandoned if `to` has not taken over within one election timeout.
+    pub async fn transfer_leadership(&self, to: NodeId) -> Result<(), TransferFailure> {
+        let (tx, rx) = oneshot::channel();
+        self.inbox
+            .send(Input::Transfer(to, tx))
+            .map_err(|_| TransferFailure::Stopped)?;
+        rx.await.map_err(|_| TransferFailure::Stopped)?
     }
 
     pub async fn status(&self) -> Option<Status> {
@@ -297,6 +334,13 @@ impl Driver {
                     last_index: self.raft.last_index(),
                     snapshot_index: self.raft.snapshot_index(),
                 });
+            }
+            Input::Transfer(to, reply) => {
+                let result = self.raft.transfer_leadership(to).map_err(|e| match e {
+                    TransferError::NotLeader { leader } => TransferFailure::NotLeader { leader },
+                    TransferError::UnknownPeer(id) => TransferFailure::UnknownPeer(id),
+                });
+                let _ = reply.send(result);
             }
             Input::Stop => return true,
         }

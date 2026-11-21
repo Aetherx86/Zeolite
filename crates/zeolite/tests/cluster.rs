@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use zeolite::http::{Gateway, router};
-use zeolite::node::{Node, NodeConfig, ProposeFailure};
+use zeolite::node::{Node, NodeConfig, ProposeFailure, TransferFailure};
 use zeolite::state::{Command, Output, VmImage};
 use zeolite_faas::Runtime;
 use zeolite_raft::Role;
@@ -324,6 +324,122 @@ async fn followers_refuse_writes_and_name_the_leader() {
         Err(ProposeFailure::NotLeader { leader: hint }) => assert_eq!(hint, Some(leader)),
         other => panic!("expected a redirect, got {other:?}"),
     }
+    cluster.cleanup();
+}
+
+/// Waits until every running node reports `target` as the leader of one shared term.
+async fn wait_for_leader(cluster: &Cluster, target: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let mut terms = Vec::new();
+        for node in cluster.nodes.values() {
+            let status = node.status().await.unwrap();
+            if status.leader == Some(target) {
+                terms.push(status.term);
+            }
+        }
+        if terms.len() == cluster.nodes.len() && terms.iter().all(|t| *t == terms[0]) {
+            return terms[0];
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("leadership never moved to node {target}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leadership_moves_to_the_requested_node() {
+    let cluster = Cluster::start(3, 1000).await;
+    cluster.propose(&deploy_counter()).await;
+    assert_eq!(executed_value(cluster.propose(&add(3)).await), 3);
+
+    let mut leader = cluster.leader().await;
+    for _ in 0..3 {
+        let term = cluster.nodes[&leader].status().await.unwrap().term;
+        let target = cluster
+            .addrs
+            .keys()
+            .copied()
+            .find(|id| *id != leader)
+            .unwrap();
+        cluster.nodes[&leader]
+            .transfer_leadership(target)
+            .await
+            .unwrap();
+        let new_term = wait_for_leader(&cluster, target).await;
+        assert_eq!(new_term, term + 1, "a hand-off costs exactly one term");
+
+        // The new leader serves writes with all earlier state intact, and the old one
+        // redirects to it.
+        let before = executed_value(cluster.nodes[&target].propose(&add(0)).await.unwrap());
+        assert_eq!(
+            executed_value(cluster.nodes[&target].propose(&add(1)).await.unwrap()),
+            before + 1
+        );
+        match cluster.nodes[&leader].propose(&add(1)).await {
+            Err(ProposeFailure::NotLeader { leader: hint }) => assert_eq!(hint, Some(target)),
+            other => panic!("expected a redirect, got {other:?}"),
+        }
+        leader = target;
+    }
+    cluster.converged().await;
+
+    let follower = cluster
+        .addrs
+        .keys()
+        .copied()
+        .find(|id| *id != leader)
+        .unwrap();
+    assert_eq!(
+        cluster.nodes[&follower].transfer_leadership(leader).await,
+        Err(TransferFailure::NotLeader {
+            leader: Some(leader)
+        })
+    );
+    assert_eq!(
+        cluster.nodes[&leader].transfer_leadership(42).await,
+        Err(TransferFailure::UnknownPeer(42))
+    );
+    cluster.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_transfers_leadership() {
+    let mut cluster = Cluster::start(3, 1000).await;
+    cluster.propose(&deploy_counter()).await;
+    let leader = cluster.leader().await;
+    let target = cluster
+        .addrs
+        .keys()
+        .copied()
+        .find(|id| *id != leader)
+        .unwrap();
+    let node = cluster.nodes.remove(&leader).unwrap();
+    let served = serve(node, Arc::new(Runtime::new().unwrap()), Some(b"secret")).await;
+    let auth = [("Authorization", "Bearer secret")];
+    let path = "/v1/leadership/transfer";
+
+    let r = http(served.addr, "POST", path, &[], b"{\"to\":2}").await;
+    assert_eq!(r.status, 401, "the endpoint requires the admin token");
+    let r = http(served.addr, "POST", path, &auth, b"{\"to\":42}").await;
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    let r = http(served.addr, "POST", path, &auth, b"not json").await;
+    assert_eq!(r.status, 400);
+
+    let body = format!("{{\"to\":{target}}}");
+    let r = http(served.addr, "POST", path, &auth, body.as_bytes()).await;
+    let text = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{text}");
+    assert!(text.contains(&format!("\"leader\":{target}")), "{text}");
+    assert!(text.contains("\"status\":\"transferred\""), "{text}");
+
+    // The former leader now redirects a second request to the new one.
+    let r = http(served.addr, "POST", path, &auth, body.as_bytes()).await;
+    let text = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 421, "{text}");
+    assert!(text.contains(&format!("\"leader\":{target}")), "{text}");
+
+    assert_eq!(executed_value(cluster.propose(&add(2)).await), 2);
+    served.server.abort();
     cluster.cleanup();
 }
 

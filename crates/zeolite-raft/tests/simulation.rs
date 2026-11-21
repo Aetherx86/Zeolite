@@ -1,7 +1,7 @@
 //! Deterministic fault-injection simulation of the Raft core.
 //!
 //! Each seed drives a cluster through message loss, duplication, reordering, partitions,
-//! crashes and log compaction, then heals the network and requires convergence. The
+//! crashes, log compaction and leadership transfers, then heals the network and requires convergence. The
 //! safety properties from the Raft paper are checked continuously:
 //!
 //! - Election Safety: at most one leader per term.
@@ -97,6 +97,13 @@ struct Sim {
     next_payload: u64,
     leader_elections: u64,
     compact_every: Option<u64>,
+    /// Percent chance per step that the leader is asked to hand off to a random peer.
+    transfer_percent: u64,
+    transfers_requested: u64,
+    /// (term the request was made in, target) for every transfer requested.
+    transfer_requests: BTreeSet<(Term, NodeId)>,
+    /// Leaders elected in the term right after a transfer to them was requested.
+    transfers_completed: u64,
 }
 
 impl Sim {
@@ -131,6 +138,10 @@ impl Sim {
             next_payload: 0,
             leader_elections: 0,
             compact_every: None,
+            transfer_percent: 0,
+            transfers_requested: 0,
+            transfer_requests: BTreeSet::new(),
+            transfers_completed: 0,
         }
     }
 
@@ -243,6 +254,9 @@ impl Sim {
             assert_eq!(other, id, "two leaders elected in term {term}");
         }
         self.leader_elections += 1;
+        if term > 0 && self.transfer_requests.contains(&(term - 1, id)) {
+            self.transfers_completed += 1;
+        }
 
         // Leader Completeness, restricted to entries provably committed in an earlier
         // term than this leader's.
@@ -315,6 +329,31 @@ impl Sim {
             }
         }
         false
+    }
+
+    fn leader(&self) -> Option<NodeId> {
+        self.nodes
+            .iter()
+            .find(|(_, n)| n.raft.as_ref().is_some_and(|r| r.role() == Role::Leader))
+            .map(|(id, _)| *id)
+    }
+
+    /// Asks the current leader, if any, to hand off to `target`.
+    fn request_transfer(&mut self, target: NodeId) -> bool {
+        let Some(leader) = self.leader() else {
+            return false;
+        };
+        let raft = self.nodes.get_mut(&leader).unwrap().raft.as_mut().unwrap();
+        let term = raft.term();
+        if raft.transfer_leadership(target).is_err() {
+            return false;
+        }
+        if target != leader {
+            self.transfers_requested += 1;
+            self.transfer_requests.insert((term, target));
+        }
+        self.drain(leader);
+        true
     }
 
     fn crash(&mut self, id: NodeId) {
@@ -410,8 +449,19 @@ fn config(id: NodeId, ids: &[NodeId], seed: u64) -> Config {
 }
 
 fn run_chaos(seed: u64, ids: &[NodeId], compact_every: Option<u64>) -> (u64, u64) {
+    let sim = run_chaos_with(seed, ids, compact_every, 0);
+    (sim.next_payload, sim.leader_elections)
+}
+
+fn run_chaos_with(
+    seed: u64,
+    ids: &[NodeId],
+    compact_every: Option<u64>,
+    transfer_percent: u64,
+) -> Sim {
     let mut sim = Sim::new(seed, ids);
     sim.compact_every = compact_every;
+    sim.transfer_percent = transfer_percent;
     sim.drop_percent = 8;
     sim.dup_percent = 5;
     sim.max_delay = 6;
@@ -423,6 +473,11 @@ fn run_chaos(seed: u64, ids: &[NodeId], compact_every: Option<u64>) -> (u64, u64
         }
         if step % 50 == 0 {
             sim.check_log_matching();
+        }
+        // Drawn only when enabled, so the other chaos tests keep their exact schedules.
+        if sim.transfer_percent > 0 && sim.rng.chance(sim.transfer_percent) {
+            let target = ids[sim.rng.below(ids.len() as u64) as usize];
+            sim.request_transfer(target);
         }
         match sim.rng.below(1000) {
             // Split the cluster at random.
@@ -475,7 +530,7 @@ fn run_chaos(seed: u64, ids: &[NodeId], compact_every: Option<u64>) -> (u64, u64
         sim.converged(),
         "seed {seed}: cluster failed to converge after healing"
     );
-    (sim.next_payload, sim.leader_elections)
+    sim
 }
 
 #[test]
@@ -617,5 +672,137 @@ fn lagging_node_catches_up_through_a_snapshot() {
     assert!(
         node.raft.as_ref().unwrap().snapshot_index() > 0,
         "catching up should have gone through a snapshot"
+    );
+}
+
+#[test]
+fn chaos_with_leadership_transfers() {
+    let (mut requested, mut completed, mut proposals) = (0, 0, 0);
+    for seed in 1..=30 {
+        let sim = run_chaos_with(seed * 0x2545_F491, &[1, 2, 3], Some(16), 2);
+        requested += sim.transfers_requested;
+        completed += sim.transfers_completed;
+        proposals += sim.next_payload;
+    }
+    for seed in 1..=10 {
+        let sim = run_chaos_with(seed * 0x4F6C_DD1D, &[1, 2, 3, 4, 5], None, 2);
+        requested += sim.transfers_requested;
+        completed += sim.transfers_completed;
+        proposals += sim.next_payload;
+    }
+    // Guards against a harness in which transfers never actually happen.
+    assert!(
+        requested > 1500,
+        "only {requested} transfers were requested"
+    );
+    assert!(completed > 500, "only {completed} transfers took effect");
+    assert!(
+        proposals > 20_000,
+        "only {proposals} proposals were accepted"
+    );
+}
+
+fn settle_leader(sim: &mut Sim) -> NodeId {
+    for _ in 0..200 {
+        sim.step_time();
+        if let Some(leader) = sim.leader() {
+            return leader;
+        }
+    }
+    panic!("no leader was elected");
+}
+
+/// On a healthy network, leadership moves to the chosen node in exactly one term, and
+/// nothing committed before the hand-off is lost.
+#[test]
+fn leadership_moves_to_the_requested_node_in_one_term() {
+    let mut sim = Sim::new(5, &[1, 2, 3, 4, 5]);
+    let mut leader = settle_leader(&mut sim);
+    for _ in 0..20 {
+        sim.propose_to_leader();
+        sim.step_time();
+    }
+    for round in 0..8 {
+        let others: Vec<NodeId> = sim.ids().into_iter().filter(|id| *id != leader).collect();
+        let target = others[round % others.len()];
+        let term = sim.nodes[&leader].raft.as_ref().unwrap().term();
+        let committed = sim.committed.len();
+        assert!(sim.request_transfer(target));
+        for _ in 0..30 {
+            sim.step_time();
+            if sim.leader() == Some(target) {
+                break;
+            }
+        }
+        assert_eq!(sim.leader(), Some(target), "round {round}: no hand-off");
+        let new_term = sim.nodes[&target].raft.as_ref().unwrap().term();
+        assert_eq!(new_term, term + 1, "a hand-off costs exactly one term");
+        assert!(sim.propose_to_leader());
+        for _ in 0..20 {
+            sim.step_time();
+        }
+        assert!(sim.committed.len() > committed);
+        leader = target;
+    }
+    sim.check_log_matching();
+    assert!(sim.converged());
+}
+
+/// A target that missed entries while it was down is caught up first, then takes over.
+#[test]
+fn a_lagging_target_is_caught_up_before_it_takes_over() {
+    let mut sim = Sim::new(31, &[1, 2, 3]);
+    sim.compact_every = Some(4);
+    let leader = settle_leader(&mut sim);
+    let target = sim.ids().into_iter().find(|id| *id != leader).unwrap();
+    sim.crash(target);
+    for _ in 0..40 {
+        sim.propose_to_leader();
+        sim.step_time();
+    }
+    sim.restart(target, 77);
+    let leader_last = sim.nodes[&leader].raft.as_ref().unwrap().last_index();
+    assert!(sim.nodes[&target].raft.as_ref().unwrap().last_index() < leader_last);
+
+    assert!(sim.request_transfer(target));
+    for _ in 0..60 {
+        sim.step_time();
+        if sim.leader() == Some(target) {
+            break;
+        }
+    }
+    assert_eq!(sim.leader(), Some(target));
+    let raft = sim.nodes[&target].raft.as_ref().unwrap();
+    assert!(
+        raft.last_index() > leader_last,
+        "the new leader holds every entry"
+    );
+    assert!(sim.propose_to_leader());
+    for _ in 0..40 {
+        sim.step_time();
+    }
+    assert!(sim.converged());
+}
+
+/// A transfer to an unreachable node expires, and the original leader keeps serving.
+#[test]
+fn a_transfer_to_an_unreachable_node_expires() {
+    let mut sim = Sim::new(41, &[1, 2, 3]);
+    let leader = settle_leader(&mut sim);
+    let term = sim.nodes[&leader].raft.as_ref().unwrap().term();
+    let target = sim.ids().into_iter().find(|id| *id != leader).unwrap();
+    sim.groups.insert(target, 1);
+    assert!(sim.request_transfer(target));
+    assert!(!sim.propose_to_leader(), "writes pause during the transfer");
+    for _ in 0..30 {
+        sim.step_time();
+    }
+    let raft = sim.nodes[&leader].raft.as_ref().unwrap();
+    assert_eq!(raft.role(), Role::Leader);
+    assert_eq!(raft.term(), term);
+    assert_eq!(raft.transfer_target(), None);
+    assert!(
+        sim.propose_to_leader(),
+        "writes resume once the transfer expires"
     );
 }

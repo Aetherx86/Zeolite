@@ -2,5 +2,6 @@
 //! sandboxed workloads, exposed through an HTTP gateway.
 
 pub mod http;
+pub mod inspect;
 pub mod node;
 pub mod state;

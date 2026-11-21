@@ -178,6 +178,10 @@ pub fn encode(env: &Envelope) -> Vec<u8> {
             put_u64(&mut o, *term);
             put_u64(&mut o, *index);
         }
+        Message::TimeoutNow { term } => {
+            o.push(9);
+            put_u64(&mut o, *term);
+        }
     }
     o
 }
@@ -245,6 +249,7 @@ pub fn decode(buf: &[u8]) -> Result<Envelope, CodecError> {
             term: r.u64()?,
             index: r.u64()?,
         },
+        9 => Message::TimeoutNow { term: r.u64()? },
         other => return Err(CodecError::UnknownTag(other)),
     };
     if !r.buf.is_empty() {
@@ -314,6 +319,7 @@ mod tests {
                 term: 10,
                 index: 100,
             },
+            Message::TimeoutNow { term: 11 },
         ]
     }
 
@@ -389,7 +395,7 @@ mod tests {
                 buf.push(x as u8);
             }
             if buf.len() > 16 {
-                buf[16] = (x % 10) as u8;
+                buf[16] = (x % 11) as u8;
             }
             let _ = decode(&buf);
         }

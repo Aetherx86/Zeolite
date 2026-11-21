@@ -50,6 +50,19 @@ pub enum Command {
     },
 }
 
+impl Command {
+    /// A stable, lowercase name for the command's kind, used in reports.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Command::DeployZel { .. } => "deploy_zel",
+            Command::DeployWasm { .. } => "deploy_wasm",
+            Command::DeployVm { .. } => "deploy_vm",
+            Command::Execute { .. } => "execute",
+            Command::Remove { .. } => "remove",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VmImage {
     RawX86LongMode(Vec<u8>),

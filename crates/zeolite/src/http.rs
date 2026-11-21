@@ -4,7 +4,7 @@
 // every error path in exchange for nothing, since these functions are never hot.
 #![allow(clippy::result_large_err)]
 
-use crate::node::{Node, ProposeFailure};
+use crate::node::{Node, ProposeFailure, TransferFailure};
 use crate::state::{Command, Output, VmImage, Workload, valid_name};
 use axum::Router;
 use axum::body::Bytes;
@@ -93,6 +93,7 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
     Router::new()
         .route("/v1/status", get(status))
         .route("/v1/digest", get(digest))
+        .route("/v1/leadership/transfer", post(transfer_leadership))
         .route("/v1/functions/{tenant}/{name}", put(deploy).delete(remove))
         .route("/v1/functions/{tenant}/{name}/invoke", post(invoke))
         .route(
@@ -140,20 +141,22 @@ fn check_names(tenant: &str, name: &str) -> Result<(), Response> {
     }
 }
 
+fn not_leader(gateway: &Gateway, leader: Option<u64>) -> Response {
+    let leader_http = leader.and_then(|id| gateway.peer_http.get(&id).cloned());
+    (
+        StatusCode::MISDIRECTED_REQUEST,
+        axum::Json(json!({
+            "error": "this node is not the leader",
+            "leader": leader,
+            "leader_http": leader_http,
+        })),
+    )
+        .into_response()
+}
+
 fn propose_failure(gateway: &Gateway, failure: ProposeFailure) -> Response {
     match failure {
-        ProposeFailure::NotLeader { leader } => {
-            let leader_http = leader.and_then(|id| gateway.peer_http.get(&id).cloned());
-            (
-                StatusCode::MISDIRECTED_REQUEST,
-                axum::Json(json!({
-                    "error": "this node is not the leader",
-                    "leader": leader,
-                    "leader_http": leader_http,
-                })),
-            )
-                .into_response()
-        }
+        ProposeFailure::NotLeader { leader } => not_leader(gateway, leader),
         ProposeFailure::Unknown => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "leadership changed; the outcome is unknown, and a retry may apply twice",
@@ -207,6 +210,75 @@ async fn digest(AxumState(gateway): AxumState<Arc<Gateway>>) -> Response {
     };
     axum::Json(json!({ "digest": digest, "applied": applied, "workloads": workloads }))
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct TransferBody {
+    to: u64,
+    #[serde(default = "default_transfer_timeout")]
+    timeout_ms: u64,
+}
+
+fn default_transfer_timeout() -> u64 {
+    5000
+}
+
+const MAX_TRANSFER_TIMEOUT_MS: u64 = 60_000;
+
+/// Hands leadership to another node, for example before taking this one down for
+/// maintenance, and waits until this node sees the target lead.
+async fn transfer_leadership(
+    AxumState(gateway): AxumState<Arc<Gateway>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = require_admin(&gateway, &headers) {
+        return r;
+    }
+    let request: TransferBody = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e),
+    };
+    let to = request.to;
+    match gateway.node.transfer_leadership(to).await {
+        Ok(()) => {}
+        Err(TransferFailure::NotLeader { leader }) => return not_leader(&gateway, leader),
+        Err(e @ TransferFailure::UnknownPeer(_)) => return error(StatusCode::BAD_REQUEST, e),
+        Err(e @ TransferFailure::Stopped) => return error(StatusCode::SERVICE_UNAVAILABLE, e),
+    }
+    let timeout = Duration::from_millis(request.timeout_ms.min(MAX_TRANSFER_TIMEOUT_MS));
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let Some(status) = gateway.node.status().await else {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "the node is stopping");
+        };
+        let done = if to == status.id {
+            status.role == zeolite_raft::Role::Leader
+        } else {
+            status.leader == Some(to) && status.role != zeolite_raft::Role::Leader
+        };
+        if done {
+            return axum::Json(json!({
+                "status": "transferred",
+                "leader": to,
+                "leader_http": gateway.peer_http.get(&to),
+                "term": status.term,
+            }))
+            .into_response();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({
+                    "error": "leadership did not move to the target in time",
+                    "leader": status.leader,
+                    "term": status.term,
+                })),
+            )
+                .into_response();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[derive(Deserialize)]

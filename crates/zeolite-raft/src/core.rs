@@ -81,6 +81,12 @@ pub enum Message {
         term: Term,
         index: Index,
     },
+    /// Sent by a leader handing off leadership: the receiver, whose log already matches
+    /// the leader's, starts an election at once without waiting for a timeout and
+    /// without a pre-vote round.
+    TimeoutNow {
+        term: Term,
+    },
 }
 
 impl Message {
@@ -93,7 +99,8 @@ impl Message {
             | Message::Append { term, .. }
             | Message::AppendResp { term, .. }
             | Message::Snapshot { term, .. }
-            | Message::SnapshotResp { term, .. } => *term,
+            | Message::SnapshotResp { term, .. }
+            | Message::TimeoutNow { term } => *term,
         }
     }
 }
@@ -155,6 +162,30 @@ pub enum ProposeError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferError {
+    /// Only the leader can hand off leadership. The hint names the leader when known.
+    NotLeader { leader: Option<NodeId> },
+    /// The target is not a member of the cluster.
+    UnknownPeer(NodeId),
+}
+
+impl std::fmt::Display for TransferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransferError::NotLeader { leader: Some(id) } => {
+                write!(f, "not the leader; node {id} is")
+            }
+            TransferError::NotLeader { leader: None } => {
+                write!(f, "not the leader, and no leader is known")
+            }
+            TransferError::UnknownPeer(id) => write!(f, "node {id} is not a cluster member"),
+        }
+    }
+}
+
+impl std::error::Error for TransferError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactError {
     /// The index has not been applied yet, so a snapshot at it would be unsafe.
     NotApplied,
@@ -181,6 +212,14 @@ impl Ready {
             && self.messages.is_empty()
             && self.committed.is_empty()
     }
+}
+
+/// A leadership hand-off in progress on the leader.
+#[derive(Clone, Copy, Debug)]
+struct Transfer {
+    target: NodeId,
+    /// Ticks since the transfer began. It is abandoned after one election timeout.
+    elapsed: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -210,6 +249,7 @@ pub struct Raft {
     quorum_elapsed: u32,
     votes: BTreeMap<NodeId, bool>,
     progress: BTreeMap<NodeId, Progress>,
+    transfer: Option<Transfer>,
 
     rng: u64,
     outbox: Vec<Envelope>,
@@ -267,6 +307,7 @@ impl Raft {
             quorum_elapsed: 0,
             votes: BTreeMap::new(),
             progress: BTreeMap::new(),
+            transfer: None,
             rng: seed,
             outbox: Vec::new(),
             hs_dirty: false,
@@ -310,6 +351,11 @@ impl Raft {
 
     pub fn last_term(&self) -> Term {
         self.log.last().map_or(self.snap_term, |e| e.term)
+    }
+
+    /// The node this leader is handing leadership to, while a transfer is in flight.
+    pub fn transfer_target(&self) -> Option<NodeId> {
+        self.transfer.map(|t| t.target)
     }
 
     pub fn snapshot_index(&self) -> Index {
@@ -385,6 +431,7 @@ impl Raft {
         self.leader = leader;
         self.votes.clear();
         self.progress.clear();
+        self.transfer = None;
         self.reset_timeout();
     }
 
@@ -403,6 +450,15 @@ impl Raft {
             Role::Leader => {
                 self.heartbeat_elapsed += 1;
                 self.quorum_elapsed += 1;
+                if let Some(transfer) = self.transfer.as_mut() {
+                    transfer.elapsed += 1;
+                    // A target that has not taken over within an election timeout is
+                    // unreachable or failing. Resume normal service rather than refusing
+                    // writes indefinitely.
+                    if transfer.elapsed >= self.cfg.election_ticks {
+                        self.transfer = None;
+                    }
+                }
                 if self.quorum_elapsed >= self.cfg.election_ticks {
                     self.quorum_elapsed = 0;
                     // Check-quorum: a leader cut off from a majority must stop acting
@@ -494,6 +550,7 @@ impl Raft {
         self.leader = Some(self.cfg.id);
         self.heartbeat_elapsed = 0;
         self.quorum_elapsed = 0;
+        self.transfer = None;
         let next = self.last_index() + 1;
         self.progress = self
             .cfg
@@ -536,6 +593,13 @@ impl Raft {
                 leader: self.leader,
             });
         }
+        // While handing off, the log must stop growing so that the target can match it.
+        // The redirect names the node that is about to lead.
+        if let Some(transfer) = self.transfer {
+            return Err(ProposeError::NotLeader {
+                leader: Some(transfer.target),
+            });
+        }
         let index = self.append_local(data);
         let caught_up: Vec<NodeId> = self
             .progress
@@ -548,6 +612,51 @@ impl Raft {
         }
         self.maybe_commit();
         Ok(index)
+    }
+
+    /// Begins handing leadership to `target`. The leader stops accepting proposals,
+    /// brings the target's log up to date, then tells it to start an election
+    /// immediately. If the target has not taken over within one election timeout, the
+    /// transfer is abandoned and this node keeps leading.
+    ///
+    /// Asking the current leader to transfer to itself succeeds and does nothing.
+    pub fn transfer_leadership(&mut self, target: NodeId) -> Result<(), TransferError> {
+        if self.role != Role::Leader {
+            return Err(TransferError::NotLeader {
+                leader: self.leader,
+            });
+        }
+        if target == self.cfg.id {
+            self.transfer = None;
+            return Ok(());
+        }
+        if !self.cfg.peers.contains(&target) {
+            return Err(TransferError::UnknownPeer(target));
+        }
+        // A repeated request for the same target keeps its original deadline.
+        if self.transfer.map(|t| t.target) != Some(target) {
+            self.transfer = Some(Transfer { target, elapsed: 0 });
+        }
+        if !self.maybe_send_timeout_now(target) {
+            self.send_append(target);
+        }
+        Ok(())
+    }
+
+    /// Sends `TimeoutNow` when `peer` is the transfer target and holds the whole log.
+    fn maybe_send_timeout_now(&mut self, peer: NodeId) -> bool {
+        if self.role != Role::Leader || self.transfer.map(|t| t.target) != Some(peer) {
+            return false;
+        }
+        let caught_up = self
+            .progress
+            .get(&peer)
+            .is_some_and(|p| p.matched == self.last_index());
+        if caught_up {
+            let term = self.term;
+            self.send(peer, Message::TimeoutNow { term });
+        }
+        caught_up
     }
 
     fn broadcast_append(&mut self) {
@@ -736,6 +845,7 @@ impl Raft {
             } => self.handle_append_resp(from, success, match_index, hint),
             Message::Snapshot { snapshot, .. } => self.handle_snapshot(from, snapshot),
             Message::SnapshotResp { index, .. } => self.handle_snapshot_resp(from, index),
+            Message::TimeoutNow { .. } => self.handle_timeout_now(),
             Message::PreVote { .. } | Message::PreVoteResp { .. } => {}
         }
     }
@@ -751,6 +861,18 @@ impl Raft {
         }
         let term = self.term;
         self.send(from, Message::VoteResp { term, granted });
+    }
+
+    fn handle_timeout_now(&mut self) {
+        // Two leaders cannot share a term, so a leader can only see this from a stale
+        // or forged sender. Ignoring it is always safe.
+        if self.role == Role::Leader {
+            return;
+        }
+        // Skipping pre-vote is what lets the election succeed while the other followers
+        // still consider the old leader live. Votes are still only granted to an
+        // up-to-date log, so safety does not depend on the sender.
+        self.start_election();
     }
 
     fn handle_vote_resp(&mut self, from: NodeId, granted: bool) {
@@ -887,6 +1009,7 @@ impl Raft {
             } else if next <= last {
                 self.send_append(from);
             }
+            self.maybe_send_timeout_now(from);
         } else {
             let rewound = hint.max(p.matched + 1).min(last + 1);
             if rewound < p.next {
@@ -954,6 +1077,7 @@ impl Raft {
         } else if next <= last {
             self.send_append(from);
         }
+        self.maybe_send_timeout_now(from);
     }
 
     /// Captures a snapshot produced by the application at `index`, which must already
